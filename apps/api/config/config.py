@@ -1,8 +1,102 @@
 import os
 import yaml
 from typing import Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from dotenv import load_dotenv
+
+
+class AcademyOfferConfig(BaseModel):
+    """Configuration for the card-only Start Shape Ship Academy offer.
+
+    This is intentionally separate from LearnHouse's organization billing
+    configuration. The offer is disabled unless every identifier and
+    credential needed to create and reconcile a purchase is configured.
+    """
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    enabled: bool = False
+    stripe_secret_key: SecretStr | None = None
+    stripe_webhook_secret: SecretStr | None = None
+    stripe_price_id: str | None = None
+    stripe_product_id: str | None = None
+    org_id: int | None = None
+    course_id: int | None = None
+    amount: int | None = None
+    currency: str | None = None
+    quantity: int = 1
+    payment_method_types: list[str] = Field(default_factory=lambda: ["card"])
+    @field_validator(
+        "stripe_secret_key",
+        "stripe_webhook_secret",
+        "stripe_price_id",
+        "stripe_product_id",
+        "currency",
+        mode="before",
+    )
+    @classmethod
+    def strip_optional_strings(cls, value):
+        if isinstance(value, SecretStr):
+            return value.get_secret_value().strip()
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+    @model_validator(mode="after")
+    def validate_enabled_offer(self) -> "AcademyOfferConfig":
+        if not self.enabled:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("stripe_secret_key", self.stripe_secret_key),
+                ("stripe_webhook_secret", self.stripe_webhook_secret),
+                ("stripe_price_id", self.stripe_price_id),
+                ("org_id", self.org_id),
+                ("course_id", self.course_id),
+                ("amount", self.amount),
+                ("currency", self.currency),
+            )
+            if value is None
+            or value == ""
+            or (isinstance(value, SecretStr) and value.get_secret_value() == "")
+        ]
+        if missing:
+            raise ValueError(
+                "Enabled Academy offer is incomplete; missing: "
+                + ", ".join(missing)
+            )
+        if (
+            self.stripe_secret_key is not None
+            and not self.stripe_secret_key.get_secret_value().startswith("sk_")
+        ):
+            raise ValueError("Academy Stripe secret key must start with sk_")
+        if (
+            self.stripe_webhook_secret is not None
+            and not self.stripe_webhook_secret.get_secret_value().startswith("whsec_")
+        ):
+            raise ValueError("Academy Stripe webhook secret must start with whsec_")
+        if self.stripe_price_id is not None and not self.stripe_price_id.startswith("price_"):
+            raise ValueError("Academy Stripe price ID must start with price_")
+        if self.stripe_product_id is not None and not self.stripe_product_id.startswith("prod_"):
+            raise ValueError("Academy Stripe product ID must start with prod_")
+        if self.org_id is not None and self.org_id <= 0:
+            raise ValueError("Academy offer org_id must be positive")
+        if self.course_id is not None and self.course_id <= 0:
+            raise ValueError("Academy offer course_id must be positive")
+        if self.amount is not None and self.amount <= 0:
+            raise ValueError("Academy offer amount must be positive")
+        if self.quantity <= 0:
+            raise ValueError("Academy offer quantity must be positive")
+        if not self.currency or len(self.currency) != 3 or not self.currency.isalpha():
+            raise ValueError("Academy offer currency must be a three-letter code")
+        if self.payment_method_types != ["card"]:
+            raise ValueError("Academy offer accepts card payments only")
+        return self
+
+
+class AcademyConfig(BaseModel):
+    offer: AcademyOfferConfig = Field(default_factory=AcademyOfferConfig)
 
 
 class CookieConfig(BaseModel):
@@ -142,6 +236,7 @@ class LearnHouseConfig(BaseModel):
     ai_config: AIConfig
     mailing_config: MailingConfig
     payments_config: InternalPaymentsConfig
+    academy_config: AcademyConfig
     tinybird_config: TinybirdConfig | None
     judge0_config: Judge0Config | None
 
@@ -511,6 +606,68 @@ def get_learnhouse_config() -> LearnHouseConfig:
         "stripe", {}
     ).get("stripe_client_id")
 
+    # Start Shape Ship Academy's card offer is deliberately isolated from
+    # LearnHouse's existing organization billing settings. Values may come
+    # from deployment environment variables or the optional YAML block.
+    academy_yaml = yaml_config.get("academy_config", {}).get("offer", {})
+    academy_enabled_raw = os.environ.get(
+        "LEARNHOUSE_ACADEMY_ENABLED", academy_yaml.get("enabled", False)
+    )
+    if isinstance(academy_enabled_raw, bool):
+        academy_enabled = academy_enabled_raw
+    elif str(academy_enabled_raw).strip().lower() in ("true", "1", "yes"):
+        academy_enabled = True
+    elif str(academy_enabled_raw).strip().lower() in ("false", "0", "no", ""):
+        academy_enabled = False
+    else:
+        raise ValueError("LEARNHOUSE_ACADEMY_ENABLED must be a boolean")
+
+    def _academy_int(name: str) -> int | None:
+        raw = os.environ.get(f"LEARNHOUSE_ACADEMY_{name}", academy_yaml.get(name.lower()))
+        if raw in (None, ""):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    academy_quantity = _academy_int("QUANTITY")
+    academy_quantity_raw = os.environ.get(
+        "LEARNHOUSE_ACADEMY_QUANTITY", academy_yaml.get("quantity")
+    )
+    if academy_quantity is None:
+        if academy_quantity_raw not in (None, "") and academy_enabled:
+            raise ValueError("LEARNHOUSE_ACADEMY_QUANTITY must be an integer")
+        academy_quantity = 1
+
+    academy_offer = AcademyOfferConfig(
+        enabled=academy_enabled,
+        stripe_secret_key=os.environ.get(
+            "LEARNHOUSE_ACADEMY_STRIPE_SECRET_KEY",
+            academy_yaml.get("stripe_secret_key"),
+        ),
+        stripe_webhook_secret=os.environ.get(
+            "LEARNHOUSE_ACADEMY_STRIPE_WEBHOOK_SECRET",
+            academy_yaml.get("stripe_webhook_secret"),
+        ),
+        stripe_price_id=os.environ.get(
+            "LEARNHOUSE_ACADEMY_STRIPE_PRICE_ID",
+            academy_yaml.get("stripe_price_id"),
+        ),
+        stripe_product_id=os.environ.get(
+            "LEARNHOUSE_ACADEMY_STRIPE_PRODUCT_ID",
+            academy_yaml.get("stripe_product_id"),
+        ),
+        org_id=_academy_int("ORG_ID"),
+        course_id=_academy_int("COURSE_ID"),
+        amount=_academy_int("AMOUNT"),
+        currency=os.environ.get(
+            "LEARNHOUSE_ACADEMY_CURRENCY", academy_yaml.get("currency")
+        ),
+        quantity=academy_quantity,
+    )
+    academy_config = AcademyConfig(offer=academy_offer)
+
     # Create HostingConfig and DatabaseConfig objects
     hosting_config = HostingConfig(
         tenancy=tenancy,
@@ -658,6 +815,7 @@ def get_learnhouse_config() -> LearnHouseConfig:
                 stripe_client_id=stripe_client_id
             )
         ),
+        academy_config=academy_config,
         tinybird_config=tinybird_config,
         judge0_config=judge0_config,
     )

@@ -66,6 +66,12 @@ payments_config:
     # Connect endpoint:   POST /payments/stripe/webhook/connect
     stripe_webhook_connect_secret: ""    # whsec_...
 
+# Dedicated Start Shape Ship Academy offer. Keep disabled in shared defaults;
+# production deployments provide credentials and IDs through LEARNHOUSE_ACADEMY_*.
+academy_config:
+  offer:
+    enabled: false
+
 ai_config:
   is_ai_enabled: false
   # Provider-agnostic generation (Pydantic AI). Set provider + api_key to use any
